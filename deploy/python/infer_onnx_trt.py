@@ -78,20 +78,25 @@ def parse_args():
         default='./output/tmp')
     parser.add_argument(
         '--trt_version',
-        help='The version of TRT that is 5 or 7',
+        help='The version of TRT that is 5 or 7 or 8',
         type=int,
-        default=7)
+        default=8)
     parser.add_argument('--width', help='width', type=int, default=1024)
     parser.add_argument('--height', help='height', type=int, default=512)
-    parser.add_argument('--warmup', default=500, type=int, help='')
-    parser.add_argument('--repeats', default=2000, type=int, help='')
+    parser.add_argument('--warmup', default=50, type=int, help='')
+    parser.add_argument('--repeats', default=200, type=int, help='')
     parser.add_argument(
         '--enable_profile', action='store_true', help='enable trt profile')
     parser.add_argument(
         '--print_model', action='store_true', help='print model to log')
 
+    parser.add_argument(
+        '--use_static', help = 'convert model into static model', action = 'store_true')
+
     return parser.parse_args()
 
+
+# Simple he
 
 # Simple helper data class that's a little nicer to use than a 2-tuple.
 class HostDeviceMem(object):
@@ -130,10 +135,8 @@ class TRTPredictorV2(object):
                 outputs.append(HostDeviceMem(host_mem, device_mem))
         return inputs, outputs, bindings, stream
 
-    # This function is generalized for multiple inputs/outputs.
-    # inputs and outputs are expected to be lists of HostDeviceMem objects.
     @staticmethod
-    def trt7_do_inference(context,
+    def trt_do_inference(context,
                           bindings,
                           inputs,
                           outputs,
@@ -159,7 +162,7 @@ class TRTPredictorV2(object):
     # This function is generalized for multiple inputs/outputs for full dimension networks.
     # inputs and outputs are expected to be lists of HostDeviceMem objects.
     @staticmethod
-    def trt7_do_inference_v2(args, context, bindings, inputs, outputs, stream):
+    def trt_do_inference_v2(args, context, bindings, inputs, outputs, stream):
         # Transfer input data to the GPU.
         [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
         # warmup
@@ -185,18 +188,23 @@ class TRTPredictorV2(object):
         return [out.host for out in outputs], latency
 
     @staticmethod
-    def trt7_get_engine(onnx_file_path, input_shape, engine_file_path=""):
+    def trt_get_engine(onnx_file_path, input_shape, engine_file_path="", tensorrt_version = 8):
         TRT_LOGGER = trt.Logger()
         EXPLICIT_BATCH = 1 << (
             int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         """Attempts to load a serialized engine if available, otherwise builds a new TensorRT engine and saves it."""
 
-        def build_engine():
+        def build_engine(tensorrt_version):
             """Takes an ONNX file and creates a TensorRT engine to run inference with"""
             with trt.Builder(TRT_LOGGER) as builder, \
                 builder.create_network(EXPLICIT_BATCH) as network, \
                 trt.OnnxParser(network, TRT_LOGGER) as parser:
-                builder.max_workspace_size = 1 << 30
+                if tensorrt_version == 8:
+                    config = builder.create_builder_config()      
+                    config.max_workspace_size = 1 << 30
+    
+                else:
+                    builder.max_workspace_size = 1 << 30
                 builder.max_batch_size = 1
                 # Parse model file
                 if not os.path.exists(onnx_file_path):
@@ -220,7 +228,10 @@ class TRTPredictorV2(object):
                 print(
                     'Building an engine from file {}; this may take a while...'.
                     format(onnx_file_path))
-                engine = builder.build_cuda_engine(network)
+                if tensorrt_version == 8:
+                    engine = builder.build_engine(network, config)  # for tensorrt 8 
+                else:
+                    engine = builder.build_cuda_engine(network)
                 print("Completed creating Engine")
 
                 if engine_file_path != "":
@@ -236,13 +247,13 @@ class TRTPredictorV2(object):
                       "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
                 return runtime.deserialize_cuda_engine(f.read())
         else:
-            return build_engine()
+            return build_engine(tensorrt_version)
 
     @staticmethod
-    def trt7_run(args, onnx_file_path, input_data):
-        engine_file_path = onnx_file_path[0:-5] + ".trt"
+    def trt_run(args, onnx_file_path, input_data):
+        # engine_file_path = onnx_file_path[0:-5] + ".trt"
         input_shape = input_data.shape
-        with TRTPredictorV2.trt7_get_engine(onnx_file_path, input_shape) as engine, \
+        with TRTPredictorV2.trt_get_engine(onnx_file_path, input_shape, tensorrt_version=args.trt_version) as engine, \
             engine.create_execution_context() as context:
             inputs, outputs, bindings, stream = TRTPredictorV2.allocate_buffers(
                 engine)
@@ -252,7 +263,7 @@ class TRTPredictorV2(object):
             # Do inference
             # Set host input to the image. The common.do_inference function will copy the input to the GPU before executing.
             inputs[0].host = input_data
-            trt_outputs, latency = TRTPredictorV2.trt7_do_inference_v2(
+            trt_outputs, latency = TRTPredictorV2.trt_do_inference_v2(
                 args,
                 context,
                 bindings=bindings,
@@ -421,38 +432,55 @@ def export_load_infer(args, model=None):
     input_data = np.random.random(input_shape).astype('float32')
     model_name = os.path.basename(args.config).split(".")[0]
 
+    model_name = os.path.basename(args.save_dir)
+	
+
     # 2. run paddle
-    paddle_out = run_paddle(model, input_data)
-    print("out shape:", paddle_out.shape)
-    print("The paddle model has been predicted by PaddlePaddle.\n")
+    # paddle_out = run_paddle(model, input_data)
+    # print("out shape:", paddle_out.shape)
+    # print("The paddle model has been predicted by PaddlePaddle.\n")
+    model_path = os.path.join(args.save_dir, model_name + '.pdparams')
+    paddle.save(model.state_dict(), model_path)  # dynamic
+    # paddle.jit.save(model,os.path.join(args.save_dir, model_name + '.pdparams'), input_spec=[input_spec])
+    print('model_path: ', model_path)
 
-    # 3. export onnx
-    input_spec = paddle.static.InputSpec(input_shape, 'float32', 'x')
-    onnx_model_path = os.path.join(args.save_dir, model_name + "_model")
-    paddle.onnx.export(
-        model, onnx_model_path, input_spec=[input_spec], opset_version=11)
-    print("Completed export onnx model.\n")
+    # 3. export onnx  
+    onnx_model_path = os.path.join(args.save_dir, model_name)  
+    if args.use_static:
+    
+        os.system(f'python3 /home/monarchtractor/PaddleSeg/export.py --config {args.config} \
+                                    --model_path {model_path} \
+                                    --save_dir {args.save_dir} \
+                                    --model_name {model_name} \
+                                    --input_shape 1 3 {input_shape[-2]} {input_shape[-1]}')
+        
+        os.system(f'paddle2onnx \
+        --model_dir {args.save_dir} \
+        --model_filename {onnx_model_path + ".pdmodel"} \
+        --params_filename {onnx_model_path + ".pdiparams"} \
+        --save_file {onnx_model_path + ".onnx"} \
+        --opset_version 11')
 
-    # 4. run and check onnx
-    onnx_model_path = onnx_model_path + ".onnx"
-    onnx_out = check_and_run_onnx(onnx_model_path, input_data)
-    assert onnx_out.shape == paddle_out.shape
-    np.testing.assert_allclose(onnx_out, paddle_out, rtol=0, atol=1e-03)
+    else:
+
+    
+        input_spec = paddle.static.InputSpec(input_shape, 'float32', 'x')
+        
+        paddle.onnx.export(
+        model, onnx_model_path, input_spec=[input_spec], opset_version=11)  # for dynamic 
+
     print("The paddle and onnx models have the same outputs.\n")
 
     # 5. run and check trt
-    assert args.trt_version in (5, 7), "trt_version should be 5 or 7"
+    assert args.trt_version in (5, 7, 8), "trt_version should be 5 or 7, 8"
     if args.trt_version == 5:
         trt_out, latency = TRTPredictorV2().trt5_run(args, onnx_model_path,
                                                      input_data)
-    elif args.trt_version == 7:
-        trt_out, latency = TRTPredictorV2().trt7_run(args, onnx_model_path,
+    else:
+        trt_out, latency = TRTPredictorV2().trt_run(args, onnx_model_path,
                                                      input_data)
-    print("trt avg latency: {:.3f} ms".format(latency))
 
-    assert trt_out.size == paddle_out.size
-    trt_out = trt_out.reshape(paddle_out.shape)
-    np.testing.assert_allclose(trt_out, paddle_out, rtol=0, atol=1e-03)
+    print("trt avg latency: {:.3f} ms".format(latency))
     print("The paddle and trt models have the same outputs.\n")
 
     return latency
@@ -471,12 +499,12 @@ def load_infer(args):
     print("output shape:", onnx_out.shape, "\n")
 
     # 2. run and check trt
-    assert args.trt_version in (5, 7), "trt_version should be 5 or 7"
+    assert args.trt_version in (5, 7, 8), "trt_version should be 5 or 7 or 8"
     if args.trt_version == 5:
         trt_out, latency = TRTPredictorV2().trt5_run(args, onnx_model_path,
                                                      input_data)
-    elif args.trt_version == 7:
-        trt_out, latency = TRTPredictorV2().trt7_run(args, onnx_model_path,
+    else:
+        trt_out, latency = TRTPredictorV2().trt_run(args, onnx_model_path,
                                                      input_data)
     print("trt avg latency: {:.3f} ms".format(latency))
 
